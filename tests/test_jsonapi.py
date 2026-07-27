@@ -311,7 +311,7 @@ class TestLocalOtbrNaming:
     """custom_routers.yaml must be able to name the polled border router."""
 
     def test_defaults_to_skyconnect(self, coordinator):
-        result = coordinator._identify_router("0123456789abcdef", True, 0)
+        result = coordinator._identify_router("0123456789abcdef", True)
 
         assert result["name"] == "SkyConnect (OTBR)"
 
@@ -323,7 +323,7 @@ class TestLocalOtbrNaming:
             "icon": "chip",
         }]
 
-        result = coordinator._identify_router("0123456789abcdef", True, 0)
+        result = coordinator._identify_router("0123456789abcdef", True)
 
         assert result["name"] == "Pi 3B+ Border Router"
         assert result["manufacturer"] == "Raspberry Pi"
@@ -337,7 +337,7 @@ class TestLocalOtbrNaming:
         }]
 
         assert coordinator._identify_router(
-            "0123456789abcdef", True, 0
+            "0123456789abcdef", True
         )["name"] == "My OTBR"
 
     def test_other_routers_are_unaffected(self, coordinator):
@@ -348,9 +348,70 @@ class TestLocalOtbrNaming:
             "icon": "chip",
         }]
 
-        result = coordinator._identify_router("fedcba9876543210", False, 0)
+        result = coordinator._identify_router("fedcba9876543210", False)
 
         assert result["name"] != "Pi 3B+ Border Router"
+
+
+class TestUnidentifiedRouterNaming:
+    """An unrecognised router must not be given a made-up vendor.
+
+    The old fallback picked a name from a rotating list by iteration order, so
+    the first unidentified router became "Eero / Amazon-Eero" no matter what it
+    actually was - which is how an IKEA air quality monitor ended up presented
+    as an Eero on the topology map.
+    """
+
+    INVENTED = {"Eero", "Google Nest", "Apple HomePod", "SmartThings"}
+
+    def test_named_after_its_address(self, coordinator):
+        result = coordinator._identify_router("6a57f823187e197b", False)
+
+        assert result["name"] == "Thread Router 197B"
+
+    def test_manufacturer_is_not_invented(self, coordinator):
+        result = coordinator._identify_router("6a57f823187e197b", False)
+
+        assert result["manufacturer"] == "Unknown"
+
+    @pytest.mark.parametrize(
+        "ext_address",
+        [
+            "6a57f823187e197b",
+            "0011223344556677",
+            "ffffffffffffffff",
+            "1234567890abcdef",
+        ],
+    )
+    def test_no_address_yields_a_vendor_name(self, coordinator, ext_address):
+        result = coordinator._identify_router(ext_address, False)
+
+        assert result["name"] not in self.INVENTED
+        assert result["manufacturer"] not in {"Amazon/Eero", "Google", "Apple", "Samsung"}
+
+    def test_distinct_addresses_get_distinct_names(self, coordinator):
+        """Names come from the address, so they no longer depend on ordering."""
+        first = coordinator._identify_router("aaaaaaaaaaaa1111", False)["name"]
+        second = coordinator._identify_router("bbbbbbbbbbbb2222", False)["name"]
+
+        assert first != second
+
+    def test_same_address_is_stable_regardless_of_call_order(self, coordinator):
+        """The old rotation gave the same node different names run to run."""
+        coordinator._identify_router("cccccccccccc3333", False)
+        repeated = coordinator._identify_router("aaaaaaaaaaaa1111", False)["name"]
+        first = coordinator._identify_router("aaaaaaaaaaaa1111", False)["name"]
+
+        assert repeated == first
+
+    def test_empty_address_does_not_crash(self, coordinator):
+        assert coordinator._identify_router("", False)["name"]
+
+    def test_known_oui_still_wins(self, coordinator):
+        """Real identification must survive; only the invented fallback goes."""
+        result = coordinator._identify_router("286D970123456789", False)
+
+        assert result["manufacturer"] == "Apple"
 
 
 class TestMatterQueryFailures:

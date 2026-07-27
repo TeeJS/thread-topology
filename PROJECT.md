@@ -90,6 +90,16 @@ enrichment failed the entire update. It self-healed on retry, but recurred
 whenever Matter lost the race. `IndexError` is now caught, with a test that
 reproduces the original failure.
 
+### Unidentified routers are no longer given invented vendors
+
+`_identify_router`'s last-resort fallback chose a name from a rotating list
+(`Eero`, `Google Nest`, `Apple HomePod`, `SmartThings`) by iteration order, so
+the first unrecognised router was labelled "Eero / Amazon-Eero" whatever it
+was. On this network that presented an IKEA air quality monitor as an Eero, and
+the label changed run to run as ordering shifted. Unidentified nodes are now
+named after their own address (`Thread Router 197B`) with manufacturer
+`Unknown`; `custom_routers.yaml` remains the way to supply a real name.
+
 ### Known follow-ups, deliberately out of scope
 
 - `_match_end_device` still matches children positionally. The JSON:API

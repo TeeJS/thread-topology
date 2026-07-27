@@ -826,7 +826,7 @@ class ThreadTopologyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         return routers
 
     def _identify_router(
-        self, ext_address: str, is_local_otbr: bool, router_index: int
+        self, ext_address: str, is_local_otbr: bool
     ) -> dict[str, str]:
         """Identify a router by its extended address or characteristics.
 
@@ -891,23 +891,16 @@ class ThreadTopologyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     "icon": "router",
                 }
 
-        # Generic fallback with numbering
-        router_names = [
-            ("Eero", "Amazon/Eero"),
-            ("Google Nest", "Google"),
-            ("Apple HomePod", "Apple"),
-            ("SmartThings", "Samsung"),
-            ("Thread Router", "Unknown"),
-        ]
-
-        # Cycle through router types based on index
-        name, manufacturer = router_names[router_index % len(router_names)]
-        if router_index > 0:
-            name = f"{name} #{router_index + 1}"
-
+        # Nothing identified it. Name the node after its own address instead of
+        # guessing a vendor: this used to pick one from a list by iteration
+        # order, so the first unrecognised router was labelled "Eero / Amazon"
+        # regardless of what it actually was. A wrong-but-confident label is
+        # worse than an honest one, and custom_routers.yaml exists to supply
+        # the real name.
+        suffix = ext_normalized[-4:] if ext_normalized else "unknown"
         return {
-            "name": name,
-            "manufacturer": manufacturer,
+            "name": f"Thread Router {suffix}",
+            "manufacturer": "Unknown",
             "type": "border_router",
             "icon": "router",
         }
@@ -988,7 +981,6 @@ class ThreadTopologyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         # Build nodes dictionary
         nodes: dict[str, dict] = {}
-        router_index = 0
         local_ext_normalized = _normalize_address(local_ext_address)
 
         for diag in diagnostics_data:
@@ -1024,9 +1016,7 @@ class ThreadTopologyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 claimed_ext_addresses.add(ext_normalized)
 
             # Get router identification (OUI lookup / custom_routers.yaml)
-            router_info = self._identify_router(ext_address, is_local_otbr, router_index)
-            if role in ("leader", "router"):
-                router_index += 1
+            router_info = self._identify_router(ext_address, is_local_otbr)
 
             # Override OUI-based name with Matter device name if we matched.
             if matter_self_match:
