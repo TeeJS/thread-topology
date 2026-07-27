@@ -1,6 +1,6 @@
 # PROJECT CHARTER — thread_topology / modern OTBR JSON:API
 
-Status: **awaiting sign-off** (created 2026-07-27)
+Status: **delivered and verified in production** (created and completed 2026-07-27)
 
 ## 1. What is the one thing this must do?
 
@@ -50,3 +50,40 @@ because `/node` now returns camelCase and `_process_topology` reads PascalCase.
    not everything collapsing to `end_device`.
 5. Update cycles complete without overlapping (task flow measured ~48 s).
 6. `pytest` green, including new tests driven by a real captured OTBR response.
+
+---
+
+## Outcome (2026-07-27)
+
+Delivered in `TeeJS/thread-topology` PR #2, merged as `622d30a`, deployed via
+HACS (`ddd858c` -> `622d30a`) after a full HA backup, and verified live.
+
+| Criterion | Result |
+|---|---|
+| 1. Entry `loaded` | Yes - first successful load since it was created |
+| 2. Network sensor | `ha-thread-0d68`, `router_count: 2` |
+| 3. Non-zero LQI | Both node sensors report `3` |
+| 4. One leader | `6a57f823187e197b`, the other node a `router` |
+| 5. No overlapping updates | Scan interval auto-raised 30s -> 180s |
+| 6. Tests green | 130 passing |
+
+The failure mode named in section 2 was real and would have shipped: the JS
+reference implementation this was ported from never requests the `mode` or
+`connectivity` diagnostic TLVs, because the visualizer draws edges from route
+data instead. Porting it faithfully would have produced loaded entities
+reporting LQI 0 for every node. `/node` had also silently moved to camelCase
+and renamed `NumOfRouter` to `routerCount`, which had been breaking leader
+detection, network name and router count independently of the 404.
+
+Also fixed along the way: the polled border router now honours
+`custom_routers.yaml` instead of being hardcoded to "SkyConnect (OTBR)", and
+the SVG write moved off the event loop.
+
+### Known follow-ups, deliberately out of scope
+
+- `_match_end_device` still matches children positionally. The JSON:API
+  `children[]` array carries each child's real extended address, which would
+  make that matching exact.
+- Home Assistant knows 13 Matter Thread devices while the mesh crawl reports
+  3 nodes. Unexplained; may need the `deviceCount` / `maxAge` crawl parameters
+  revisited, or those devices may simply be offline.
