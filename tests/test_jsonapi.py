@@ -8,6 +8,7 @@ wrong in the same way the code did.
 from __future__ import annotations
 
 import sys
+from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
@@ -349,6 +350,49 @@ class TestLocalOtbrNaming:
         result = coordinator._identify_router("fedcba9876543210", False, 0)
 
         assert result["name"] != "Pi 3B+ Border Router"
+
+
+class TestSvgWriting:
+    """The SVG write must stay off the event loop."""
+
+    def test_write_svg_creates_the_directory_and_file(self, coordinator, tmp_path):
+        www = tmp_path / "www"
+        coordinator.hass.config.path.return_value = str(www)
+
+        written = coordinator._write_svg("<svg/>")
+
+        assert Path(written) == www / "thread_topology.svg"
+        assert Path(written).read_text(encoding="utf-8") == "<svg/>"
+
+    def test_write_svg_tolerates_an_existing_directory(self, coordinator, tmp_path):
+        www = tmp_path / "www"
+        www.mkdir()
+        coordinator.hass.config.path.return_value = str(www)
+
+        assert coordinator._write_svg("<svg/>")
+
+    async def test_save_svg_delegates_to_the_executor(self, coordinator):
+        """Home Assistant warns if file I/O runs inline on the event loop."""
+        calls = []
+
+        async def fake_executor(func, *args):
+            calls.append((func, args))
+            return "/config/www/thread_topology.svg"
+
+        coordinator.hass.async_add_executor_job = fake_executor
+
+        result = await coordinator.save_svg_to_www({"nodes": {}})
+
+        assert result == "/local/thread_topology.svg"
+        assert calls and calls[0][0] == coordinator._write_svg
+
+    async def test_save_svg_survives_a_write_failure(self, coordinator):
+        async def failing_executor(func, *args):
+            raise OSError("read-only filesystem")
+
+        coordinator.hass.async_add_executor_job = failing_executor
+
+        assert await coordinator.save_svg_to_www({"nodes": {}}) is None
 
 
 class TestProcessTopologyStillHandlesLegacy:

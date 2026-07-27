@@ -1383,19 +1383,28 @@ class ThreadTopologyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         svg += '</svg>'
         return svg
 
+    def _write_svg(self, svg_content: str) -> str:
+        """Write the SVG to the www folder. Runs in an executor thread."""
+        www_path = self.hass.config.path("www")
+        os.makedirs(www_path, exist_ok=True)
+
+        svg_path = os.path.join(www_path, "thread_topology.svg")
+        with open(svg_path, "w", encoding="utf-8") as f:
+            f.write(svg_content)
+
+        return svg_path
+
     async def save_svg_to_www(self, topology: dict[str, Any]) -> str | None:
         """Generate SVG and save to www folder."""
         try:
             svg_content = self.generate_svg(topology)
-            www_path = self.hass.config.path("www")
 
-            # Create www folder if it doesn't exist
-            if not os.path.exists(www_path):
-                os.makedirs(www_path)
-
-            svg_path = os.path.join(www_path, "thread_topology.svg")
-            with open(svg_path, "w", encoding="utf-8") as f:
-                f.write(svg_content)
+            # Creating directories and writing the file blocks; doing it inline
+            # stalls the event loop on every update and Home Assistant logs a
+            # warning asking for a bug report.
+            svg_path = await self.hass.async_add_executor_job(
+                self._write_svg, svg_content
+            )
 
             _LOGGER.debug("SVG saved to %s", svg_path)
             return "/local/thread_topology.svg"
