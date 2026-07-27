@@ -741,7 +741,13 @@ class ThreadTopologyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                                     pass
 
                     node_info_by_id[node.node_id] = (mac, ips)
-            except (KeyError, StopIteration, AttributeError, ImportError) as err:
+            # IndexError covers get_matter() indexing into hass.data["matter"]
+            # before the Matter integration has finished setting up - a restart
+            # race that would otherwise fail the whole update over what is only
+            # optional enrichment.
+            except (
+                KeyError, IndexError, StopIteration, AttributeError, ImportError
+            ) as err:
                 _LOGGER.debug("Could not query Matter client for node diagnostics: %s", err)
 
         for device in device_registry.devices.values():

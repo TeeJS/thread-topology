@@ -22,6 +22,7 @@ sys.modules.setdefault("homeassistant.helpers", MagicMock())
 sys.modules.setdefault("homeassistant.helpers.device_registry", MagicMock())
 sys.modules.setdefault("homeassistant.helpers.update_coordinator", MagicMock())
 
+from custom_components.thread_topology import coordinator as coordinator_module  # noqa: E402
 from custom_components.thread_topology.coordinator import (  # noqa: E402
     ThreadTopologyCoordinator,
     _link_margin_to_lqi,
@@ -350,6 +351,50 @@ class TestLocalOtbrNaming:
         result = coordinator._identify_router("fedcba9876543210", False, 0)
 
         assert result["name"] != "Pi 3B+ Border Router"
+
+
+class TestMatterQueryFailures:
+    """Matter data is optional enrichment; a failure must not fail the update.
+
+    The IndexError case is a real restart race: Home Assistant's get_matter()
+    indexes into hass.data["matter"], which is still empty if the Matter
+    integration has not finished setting up. It put the config entry into
+    setup_retry with "list index out of range".
+    """
+
+    @pytest.fixture
+    def matter_ready(self, coordinator, monkeypatch) -> ThreadTopologyCoordinator:
+        """Make the Matter branch reachable without Home Assistant installed."""
+        monkeypatch.setitem(sys.modules, "chip", MagicMock())
+        monkeypatch.setitem(sys.modules, "chip.clusters", MagicMock())
+        monkeypatch.setattr(coordinator_module, "_MATTER_AVAILABLE", True)
+
+        registry = MagicMock()
+        registry.devices.values.return_value = []
+        monkeypatch.setattr(
+            coordinator_module.dr, "async_get", lambda hass: registry
+        )
+        return coordinator
+
+    @pytest.mark.parametrize(
+        "error",
+        [
+            IndexError("list index out of range"),
+            KeyError("matter"),
+            StopIteration(),
+            AttributeError("adapter"),
+            ImportError("chip"),
+        ],
+    )
+    def test_survives_matter_client_errors(self, matter_ready, monkeypatch, error):
+        monkeypatch.setattr(
+            coordinator_module,
+            "get_matter",
+            MagicMock(side_effect=error),
+            raising=False,
+        )
+
+        assert matter_ready._get_matter_devices() == []
 
 
 class TestSvgWriting:
