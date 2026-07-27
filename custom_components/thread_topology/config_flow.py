@@ -37,8 +37,15 @@ class ThreadTopologyConfigFlow(ConfigFlow, domain=DOMAIN):
                         timeout=aiohttp.ClientTimeout(total=10),
                     ) as response:
                         if response.status == 200:
-                            data = await response.json()
-                            network_name = data.get("NetworkName", "Thread Network")
+                            # OTBR serves this as application/json today, but
+                            # do not let a media type change break setup.
+                            data = await response.json(content_type=None)
+                            # Current builds renamed NetworkName to networkName.
+                            network_name = (
+                                data.get("networkName")
+                                or data.get("NetworkName")
+                                or "Thread Network"
+                            )
 
                             # Check if already configured
                             await self.async_set_unique_id(network_name)

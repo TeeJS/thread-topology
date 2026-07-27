@@ -106,10 +106,26 @@ For more complete examples including stats tiles and styled cards, see the [exam
 
 ## How It Works
 
-1. **OTBR API**: Fetches network data from `/node` and `/diagnostics` endpoints
+1. **OTBR API**: Fetches network data from the border router's REST API
 2. **Device Registry**: Queries Home Assistant's device registry for Matter devices
 3. **Smart Matching**: Maps Thread extended addresses to Matter device names
 4. **Transport Detection**: Identifies WiFi vs Thread based on device model/manufacturer
+
+### OTBR REST API versions
+
+ot-br-posix has two REST API generations, and the integration detects which one
+your border router serves:
+
+| | Legacy | Current (JSON:API) |
+|---|---|---|
+| Topology source | `GET /diagnostics` | task workflow via `/api/actions` |
+| Field naming | `PascalCase` | `camelCase`, JSON:API envelope |
+| Poll interval | 30s | 180s |
+
+Newer builds return 404 for `/diagnostics` and instead require posting a mesh
+crawl task, reading `/api/devices`, then requesting a network diagnostic per
+router. That crawl takes a minute or more, so when the JSON:API workflow is
+detected the scan interval is raised automatically to avoid overlapping polls.
 
 ## Supported Border Routers
 

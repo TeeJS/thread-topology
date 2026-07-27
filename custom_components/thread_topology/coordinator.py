@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 from datetime import timedelta
@@ -23,15 +24,34 @@ except ImportError:
     _MATTER_AVAILABLE = False
 
 from .const import (
+    API_MODE_JSONAPI,
+    API_MODE_LEGACY,
+    API_MODE_UNKNOWN,
+    CONTENT_TYPE_JSONAPI,
     DEFAULT_SCAN_INTERVAL,
+    DEVICE_COLLECTION_ATTRS,
+    DIAGNOSTIC_TASK_TIMEOUT,
+    DIAGNOSTIC_TYPES,
     DOMAIN,
+    ENDPOINT_ACTIONS,
+    ENDPOINT_API_DIAGNOSTICS,
+    ENDPOINT_DEVICES,
     ENDPOINT_DIAGNOSTICS,
     ENDPOINT_NODE,
+    JSONAPI_SCAN_INTERVAL,
+    REQUEST_TIMEOUT,
+    ROUTING_ROLES,
+    TASK_POLL_INTERVAL,
+    TASK_TIMEOUT,
 )
 
 _LOGGER = logging.getLogger(__name__)
 
 CUSTOM_ROUTERS_FILE = "custom_routers.yaml"
+
+
+class OtbrTaskError(Exception):
+    """A JSON:API diagnostic task failed, was stopped, or timed out."""
 
 # Known Thread Border Router OUI prefixes (first 6 chars of extended address)
 # These are based on IEEE OUI database and known devices
@@ -93,6 +113,267 @@ def _normalize_address(address: str) -> str:
     return address.replace(":", "").replace("-", "").replace(" ", "").upper()
 
 
+# --- JSON:API -> legacy translation ----------------------------------------
+#
+# Current ot-br-posix builds return camelCase fields wrapped in a JSON:API
+# envelope. Everything downstream of the fetch layer (_process_topology, the
+# sensors, the SVG) reads the legacy flat PascalCase shape, so we translate on
+# the way in rather than touching all of it.
+#
+# The translation is not purely a case change:
+#   * Rloc16 is a hex string ("0xf800") here, an int in the legacy API. The
+#     downstream code does arithmetic on it, so it must come out as an int.
+#   * Mode.FullThreadDevice was renamed deviceTypeFTD, and legacy Mode flags
+#     are 0/1 ints rather than booleans.
+#   * /node renamed NumOfRouter to routerCount outright.
+
+
+def _parse_rloc(value: Any) -> int | None:
+    """Parse an RLOC16 given as an int or a hex string like '0xf800'."""
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        return int(text, 16)
+    except ValueError:
+        return None
+
+
+def _first(mapping: dict, *names: str, default: Any = None) -> Any:
+    """Return the first present, non-None value among `names`."""
+    for name in names:
+        if mapping.get(name) is not None:
+            return mapping[name]
+    return default
+
+
+def _link_margin_to_lqi(margin: Any) -> int:
+    """Map a link margin in dB to OpenThread's 0-3 link quality scale."""
+    if not isinstance(margin, (int, float)):
+        return 0
+    if margin >= 20:
+        return 3
+    if margin >= 10:
+        return 2
+    if margin >= 2:
+        return 1
+    return 0
+
+
+def _translate_mode(mode: Any) -> dict[str, int]:
+    """Translate a JSON:API mode object into the legacy Mode shape."""
+    if not isinstance(mode, dict):
+        return {}
+
+    def flag(*names: str) -> int:
+        value = _first(mode, *names)
+        return int(bool(value))
+
+    return {
+        "RxOnWhenIdle": flag("rxOnWhenIdle", "RxOnWhenIdle"),
+        "DeviceType": flag("deviceTypeFTD", "fullThreadDevice", "DeviceType"),
+        "NetworkData": flag("fullNetworkData", "NetworkData"),
+    }
+
+
+def _translate_connectivity(connectivity: Any) -> dict[str, int]:
+    """Translate a JSON:API connectivity object into the legacy shape.
+
+    This is what the per-node link quality sensors are built from.
+    """
+    if not isinstance(connectivity, dict):
+        return {}
+
+    def num(*names: str) -> int:
+        value = _first(connectivity, *names, default=0)
+        return int(value) if isinstance(value, (int, float)) else 0
+
+    return {
+        "ParentPriority": num("parentPriority", "ParentPriority"),
+        "LinkQuality3": num("linkQuality3", "LinkQuality3"),
+        "LinkQuality2": num("linkQuality2", "LinkQuality2"),
+        "LinkQuality1": num("linkQuality1", "LinkQuality1"),
+        "LeaderCost": num("leaderCost", "LeaderCost"),
+        "IdSequence": num("idSequence", "IdSequence"),
+        "ActiveRouters": num("activeRouters", "ActiveRouters"),
+    }
+
+
+def _translate_route_data(attributes: dict) -> list[dict]:
+    """Build the legacy Route.RouteData list.
+
+    Prefers the real route table. Some builds return only routerNeighbors, in
+    which case we synthesize equivalent entries with link quality derived from
+    the neighbour's link margin.
+    """
+    route = attributes.get("route")
+    entries = route.get("routeData") if isinstance(route, dict) else None
+
+    if isinstance(entries, list):
+        return [
+            {
+                "RouteId": _first(entry, "routeId", "RouteId", default=0),
+                "LinkQualityIn": _first(entry, "linkQualityIn", "LinkQualityIn", default=0),
+                "LinkQualityOut": _first(entry, "linkQualityOut", "LinkQualityOut", default=0),
+                "RouteCost": _first(entry, "routeCost", "RouteCost", default=0),
+            }
+            for entry in entries
+            if isinstance(entry, dict)
+        ]
+
+    neighbors = attributes.get("routerNeighbors")
+    if not isinstance(neighbors, list):
+        return []
+
+    route_data = []
+    for neighbor in neighbors:
+        if not isinstance(neighbor, dict):
+            continue
+        peer_rloc = _parse_rloc(_first(neighbor, "rloc16", "addr"))
+        lqi = _link_margin_to_lqi(neighbor.get("linkMargin"))
+        route_data.append({
+            "RouteId": (peer_rloc >> 10) if peer_rloc is not None else 0,
+            "LinkQualityIn": lqi,
+            "LinkQualityOut": lqi,
+            "RouteCost": 0,
+        })
+    return route_data
+
+
+def _translate_child_table(attributes: dict) -> list[dict]:
+    """Build the legacy ChildTable from the childTable and children arrays.
+
+    Both may be present and they carry different fields: childTable mirrors the
+    legacy TLV, while children additionally exposes each child's extended
+    address and RLOC16. We merge them by child id, letting childTable win on
+    fields they share.
+    """
+    rows: dict[Any, dict] = {}
+    order: list[Any] = []
+
+    for source in ("children", "childTable"):
+        entries = attributes.get(source)
+        if not isinstance(entries, list):
+            continue
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+
+            rloc = _parse_rloc(entry.get("rloc16"))
+            child_id = entry.get("childId")
+            if child_id is None and rloc is not None:
+                child_id = rloc & 0x1FF
+
+            key = child_id if child_id is not None else f"#{len(order)}"
+            row = rows.get(key)
+            if row is None:
+                row = {"ChildId": child_id if child_id is not None else 0}
+                rows[key] = row
+                order.append(key)
+
+            # In children[] the mode flags sit at the top level; in
+            # childTable[] they are nested under "mode".
+            mode_src = entry.get("mode") if isinstance(entry.get("mode"), dict) else entry
+            translated_mode = _translate_mode(mode_src)
+            if translated_mode:
+                row["Mode"] = translated_mode
+
+            if isinstance(entry.get("timeout"), int):
+                row["Timeout"] = entry["timeout"]
+            if isinstance(entry.get("linkQuality"), int):
+                row["LinkQuality"] = entry["linkQuality"]
+            if entry.get("extAddress"):
+                row["ExtAddress"] = entry["extAddress"]
+            if rloc is not None:
+                row["Rloc16"] = rloc
+            addresses = entry.get("ipv6Addresses")
+            if isinstance(addresses, list) and addresses:
+                row["IP6AddressList"] = addresses
+
+    return [rows[key] for key in order]
+
+
+def _translate_diagnostic(item: Any) -> dict[str, Any]:
+    """Convert one JSON:API networkDiagnostics item to the legacy flat shape."""
+    attributes = item.get("attributes") if isinstance(item, dict) else None
+    if not isinstance(attributes, dict):
+        return {}
+
+    rloc = _parse_rloc(attributes.get("rloc16"))
+    result: dict[str, Any] = {
+        "ExtAddress": attributes.get("extAddress", ""),
+        "Rloc16": rloc if rloc is not None else 0,
+        "IP6AddressList": attributes.get("ipv6Addresses") or [],
+    }
+
+    mode = _translate_mode(attributes.get("mode"))
+    if mode:
+        result["Mode"] = mode
+
+    connectivity = _translate_connectivity(attributes.get("connectivity"))
+    if connectivity:
+        result["Connectivity"] = connectivity
+
+    route_data = _translate_route_data(attributes)
+    if route_data:
+        result["Route"] = {"RouteData": route_data}
+
+    child_table = _translate_child_table(attributes)
+    if child_table:
+        result["ChildTable"] = child_table
+
+    if attributes.get("leaderData"):
+        result["LeaderData"] = attributes["leaderData"]
+
+    # Authoritative leader flag - far better than inferring the leader from
+    # whichever node happens to be the OTBR we are talking to.
+    if attributes.get("isLeader") is not None:
+        result["IsLeader"] = bool(attributes["isLeader"])
+    if attributes.get("isBorderRouter") is not None:
+        result["IsBorderRouter"] = bool(attributes["isBorderRouter"])
+
+    return result
+
+
+# /node kept its route but renamed its fields; NumOfRouter became routerCount.
+_NODE_FIELD_ALIASES = {
+    "ExtAddress": ("ExtAddress", "extAddress"),
+    "NetworkName": ("NetworkName", "networkName"),
+    "NumOfRouter": ("NumOfRouter", "routerCount"),
+    "State": ("State", "state"),
+    "Rloc16": ("Rloc16", "rloc16"),
+    "LeaderData": ("LeaderData", "leaderData"),
+    "ExtPanId": ("ExtPanId", "extPanId"),
+    "RlocAddress": ("RlocAddress", "rlocAddress"),
+}
+
+
+def _translate_node(node_data: Any) -> dict[str, Any]:
+    """Normalize a /node response to the legacy PascalCase key names.
+
+    Original keys are preserved; canonical ones are added alongside, so this is
+    a no-op on OTBR builds that already speak PascalCase.
+    """
+    if not isinstance(node_data, dict):
+        return {}
+
+    result = dict(node_data)
+    for canonical, aliases in _NODE_FIELD_ALIASES.items():
+        value = _first(node_data, *aliases)
+        if value is not None:
+            result[canonical] = value
+
+    rloc = _parse_rloc(result.get("Rloc16"))
+    if rloc is not None:
+        result["Rloc16"] = rloc
+
+    return result
+
+
 class ThreadTopologyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     """Coordinator to fetch Thread topology data from OTBR."""
 
@@ -113,6 +394,7 @@ class ThreadTopologyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._session: aiohttp.ClientSession | None = None
         self._router_index = 0  # Track router numbering
         self._custom_routers: list[dict[str, str]] = self._load_custom_routers()
+        self._api_mode = API_MODE_UNKNOWN
 
     def _load_custom_routers(self) -> list[dict[str, str]]:
         """Load user-defined border routers from custom_routers.yaml."""
@@ -166,11 +448,12 @@ class ThreadTopologyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             # Reset router index for each update
             self._router_index = 0
 
-            # Fetch node info
-            node_data = await self._fetch_endpoint(ENDPOINT_NODE)
+            # Fetch node info. Field names differ between REST generations, so
+            # normalize before anything downstream reads it.
+            node_data = _translate_node(await self._fetch_endpoint(ENDPOINT_NODE))
 
             # Fetch diagnostics (topology)
-            diagnostics_data = await self._fetch_endpoint(ENDPOINT_DIAGNOSTICS)
+            diagnostics_data = await self._fetch_diagnostics()
 
             # Get Matter devices from HA device registry
             matter_devices = self._get_matter_devices()
@@ -192,13 +475,197 @@ class ThreadTopologyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             raise UpdateFailed(f"Error communicating with OTBR: {err}") from err
         except asyncio.TimeoutError as err:
             raise UpdateFailed(f"Timeout communicating with OTBR: {err}") from err
+        except OtbrTaskError as err:
+            raise UpdateFailed(f"OTBR diagnostic task failed: {err}") from err
 
     async def _fetch_endpoint(self, endpoint: str) -> Any:
         """Fetch data from a specific OTBR endpoint."""
         url = f"{self.otbr_url}{endpoint}"
-        async with self._session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as response:
+        async with self._session.get(
+            url, timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT)
+        ) as response:
             response.raise_for_status()
-            return await response.json()
+            # OTBR serves JSON:API routes as application/vnd.api+json, which
+            # aiohttp refuses to decode unless we stop it checking.
+            return await response.json(content_type=None)
+
+    # --- diagnostics fetching ----------------------------------------------
+
+    async def _fetch_diagnostics(self) -> list[dict[str, Any]]:
+        """Fetch mesh diagnostics, auto-detecting which REST API is served.
+
+        Legacy builds answer GET /diagnostics directly. Current builds return
+        404 there and require a JSON:API task workflow instead. We probe once
+        and remember, but re-probe if a legacy OTBR is later upgraded.
+        """
+        if self._api_mode != API_MODE_JSONAPI:
+            try:
+                data = await self._fetch_endpoint(ENDPOINT_DIAGNOSTICS)
+            except aiohttp.ClientResponseError as err:
+                if err.status != 404:
+                    raise
+                _LOGGER.info(
+                    "OTBR has no legacy /diagnostics endpoint (404); "
+                    "using the JSON:API task workflow"
+                )
+                self._set_api_mode(API_MODE_JSONAPI)
+            else:
+                self._set_api_mode(API_MODE_LEGACY)
+                return data if isinstance(data, list) else [data]
+
+        return await self._fetch_diagnostics_jsonapi()
+
+    def _set_api_mode(self, mode: str) -> None:
+        """Record which REST generation the OTBR speaks.
+
+        The JSON:API flow makes OTBR crawl the whole mesh, which takes longer
+        than the legacy poll interval, so stretch the interval to match.
+        """
+        if self._api_mode == mode:
+            return
+
+        self._api_mode = mode
+        _LOGGER.debug("OTBR API mode set to %s", mode)
+
+        if mode != API_MODE_JSONAPI:
+            return
+
+        slower = timedelta(seconds=JSONAPI_SCAN_INTERVAL)
+        if self.update_interval is not None and self.update_interval < slower:
+            _LOGGER.info(
+                "Raising scan interval to %ss: the JSON:API mesh crawl takes "
+                "longer than the configured %ss",
+                JSONAPI_SCAN_INTERVAL,
+                int(self.update_interval.total_seconds()),
+            )
+            self.update_interval = slower
+
+    async def _fetch_diagnostics_jsonapi(self) -> list[dict[str, Any]]:
+        """Run the three-step JSON:API diagnostic workflow."""
+        # 1. Ask OTBR to crawl the mesh, which is what populates /api/devices.
+        task_id = await self._post_action({
+            "type": "updateDeviceCollectionTask",
+            "attributes": DEVICE_COLLECTION_ATTRS,
+        })
+        await self._wait_for_task(task_id, "device collection")
+
+        # 2. Learn which devices are worth querying.
+        payload = await self._fetch_json(ENDPOINT_DEVICES)
+        devices = payload.get("data") or []
+        routers = [
+            device for device in devices
+            if str((device.get("attributes") or {}).get("role") or "").lower()
+            in ROUTING_ROLES
+        ]
+        if not routers:
+            # Some builds leave role empty until the crawl settles.
+            _LOGGER.debug("No routing-role devices reported; querying all %d", len(devices))
+            routers = devices
+
+        _LOGGER.debug("Device collection: %d total, %d routing", len(devices), len(routers))
+
+        # 3. Ask each router for its diagnostics, concurrently.
+        results = await asyncio.gather(
+            *(self._fetch_router_diagnostic(device) for device in routers)
+        )
+
+        diagnostics = [
+            translated
+            for item in results
+            if item and (translated := _translate_diagnostic(item))
+        ]
+
+        if not diagnostics:
+            raise OtbrTaskError(
+                f"no diagnostics returned by any of {len(routers)} device(s)"
+            )
+
+        _LOGGER.debug(
+            "Collected diagnostics from %d/%d router(s)", len(diagnostics), len(routers)
+        )
+        return diagnostics
+
+    async def _fetch_router_diagnostic(self, device: dict) -> dict | None:
+        """Request and collect one router's network diagnostic."""
+        device_id = device.get("id")
+        try:
+            task_id = await self._post_action({
+                "type": "getNetworkDiagnosticTask",
+                "attributes": {
+                    "destination": device_id,
+                    "types": DIAGNOSTIC_TYPES,
+                    "timeout": DIAGNOSTIC_TASK_TIMEOUT,
+                },
+            })
+            task = await self._wait_for_task(task_id, f"diagnostic {device_id}")
+
+            # The finished task points at the stored diagnostic document.
+            relationships = task.get("relationships") or {}
+            result_ref = (relationships.get("result") or {}).get("data") or {}
+            diagnostic_id = result_ref.get("id")
+            if not diagnostic_id:
+                _LOGGER.debug("Task for %s produced no diagnostic result", device_id)
+                return None
+
+            payload = await self._fetch_json(f"{ENDPOINT_API_DIAGNOSTICS}/{diagnostic_id}")
+            return payload.get("data")
+        except (aiohttp.ClientError, asyncio.TimeoutError, OtbrTaskError) as err:
+            # One unreachable router should not fail the whole update.
+            _LOGGER.debug("Skipping diagnostics for %s: %s", device_id, err)
+            return None
+
+    async def _fetch_json(self, endpoint: str) -> dict[str, Any]:
+        """GET a JSON:API endpoint."""
+        url = f"{self.otbr_url}{endpoint}"
+        async with self._session.get(
+            url,
+            headers={"Accept": CONTENT_TYPE_JSONAPI},
+            timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT),
+        ) as response:
+            response.raise_for_status()
+            return await response.json(content_type=None)
+
+    async def _post_action(self, task: dict[str, Any]) -> str:
+        """POST a task to /api/actions and return its id."""
+        url = f"{self.otbr_url}{ENDPOINT_ACTIONS}"
+        async with self._session.post(
+            url,
+            data=json.dumps({"data": [task]}),
+            headers={
+                "Accept": CONTENT_TYPE_JSONAPI,
+                "Content-Type": CONTENT_TYPE_JSONAPI,
+            },
+            timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT),
+        ) as response:
+            response.raise_for_status()
+            payload = await response.json(content_type=None)
+
+        data = payload.get("data")
+        items = data if isinstance(data, list) else [data]
+        if not items or not isinstance(items[0], dict) or not items[0].get("id"):
+            raise OtbrTaskError(f"{ENDPOINT_ACTIONS} returned no task id")
+        return items[0]["id"]
+
+    async def _wait_for_task(self, task_id: str, label: str) -> dict[str, Any]:
+        """Poll a task until it completes."""
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + TASK_TIMEOUT
+
+        while loop.time() < deadline:
+            await asyncio.sleep(TASK_POLL_INTERVAL)
+            try:
+                payload = await self._fetch_json(f"{ENDPOINT_ACTIONS}/{task_id}")
+            except (aiohttp.ClientError, asyncio.TimeoutError):
+                continue  # transient; try again on the next poll
+
+            item = payload.get("data") or payload
+            status = str((item.get("attributes") or {}).get("status") or "").lower()
+            if status == "completed":
+                return item
+            if status in ("stopped", "failed"):
+                raise OtbrTaskError(f"task '{label}' {status}")
+
+        raise OtbrTaskError(f"task '{label}' timed out after {TASK_TIMEOUT}s")
 
     def _get_matter_devices(self) -> list[dict[str, Any]]:
         """Get Matter devices from Home Assistant device registry.
@@ -353,21 +820,19 @@ class ThreadTopologyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         return routers
 
     def _identify_router(
-        self, ext_address: str, is_leader: bool, router_index: int
+        self, ext_address: str, is_local_otbr: bool, router_index: int
     ) -> dict[str, str]:
-        """Identify a router by its extended address or characteristics."""
-        # Check if this is the OTBR leader (typically SkyConnect or similar)
-        if is_leader:
-            return {
-                "name": "SkyConnect (OTBR)",
-                "manufacturer": "Nabu Casa",
-                "type": "border_router",
-                "icon": "home-assistant",
-            }
+        """Identify a router by its extended address or characteristics.
 
+        `is_local_otbr` marks the border router this integration polls, which
+        is named directly rather than guessed at from its OUI. Note this is a
+        separate question from which node holds Thread leadership.
+        """
         ext_normalized = _normalize_address(ext_address)
 
-        # Check custom routers first (user-defined in custom_routers.yaml)
+        # Check custom routers first (user-defined in custom_routers.yaml).
+        # These take precedence over every built-in guess, including the name
+        # for the border router we poll - plenty of OTBRs are not SkyConnects.
         for custom in self._custom_routers:
             custom_addr = custom["address"]
             # Exact full match, OUI prefix match (first 6 hex chars), or substring
@@ -382,6 +847,15 @@ class ThreadTopologyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     "type": "border_router",
                     "icon": custom.get("icon", "router"),
                 }
+
+        # The OTBR we talk to, if the user has not named it themselves
+        if is_local_otbr:
+            return {
+                "name": "SkyConnect (OTBR)",
+                "manufacturer": "Nabu Casa",
+                "type": "border_router",
+                "icon": "home-assistant",
+            }
 
         # Convert extended address to OUI format (XX:XX:XX)
         if len(ext_normalized) >= 6:
@@ -481,11 +955,15 @@ class ThreadTopologyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         thread_routers: list[dict],
     ) -> dict[str, Any]:
         """Process raw OTBR data into topology structure."""
-        # Get leader info
-        leader_ext_address = node_data.get("ExtAddress", "")
+        # /node describes the border router we are polling, which is not
+        # necessarily the Thread leader - it may well be a plain router.
+        local_ext_address = node_data.get("ExtAddress", "")
         network_name = node_data.get("NetworkName", "Unknown")
         num_routers = node_data.get("NumOfRouter", 0)
         state = node_data.get("State", "unknown")
+
+        # Fall back to the polled OTBR until a node claims leadership.
+        leader_ext_address = local_ext_address
 
         # Separate Thread and WiFi Matter devices
         thread_matter = [d for d in matter_devices if d["transport"] == "thread"]
@@ -505,7 +983,7 @@ class ThreadTopologyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # Build nodes dictionary
         nodes: dict[str, dict] = {}
         router_index = 0
-        leader_ext_normalized = _normalize_address(leader_ext_address)
+        local_ext_normalized = _normalize_address(local_ext_address)
 
         for diag in diagnostics_data:
             ext_address = diag.get("ExtAddress", "")
@@ -515,7 +993,15 @@ class ThreadTopologyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             # Determine device role
             mode = diag.get("Mode", {})
             is_router = mode.get("DeviceType", 0) == 1
-            is_leader = ext_normalized == leader_ext_normalized
+            is_local_otbr = bool(local_ext_normalized) and ext_normalized == local_ext_normalized
+
+            # Current OTBR builds state outright which node holds leadership.
+            # Legacy builds do not, so assume the OTBR we polled is the leader,
+            # which is what this integration has always done.
+            diag_is_leader = diag.get("IsLeader")
+            is_leader = is_local_otbr if diag_is_leader is None else diag_is_leader
+            if is_leader:
+                leader_ext_address = ext_address
 
             if is_leader:
                 role = "leader"
@@ -532,7 +1018,7 @@ class ThreadTopologyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 claimed_ext_addresses.add(ext_normalized)
 
             # Get router identification (OUI lookup / custom_routers.yaml)
-            router_info = self._identify_router(ext_address, is_leader, router_index)
+            router_info = self._identify_router(ext_address, is_local_otbr, router_index)
             if role in ("leader", "router"):
                 router_index += 1
 
