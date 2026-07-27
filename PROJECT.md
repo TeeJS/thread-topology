@@ -79,6 +79,17 @@ Also fixed along the way: the polled border router now honours
 `custom_routers.yaml` instead of being hardcoded to "SkyConnect (OTBR)", and
 the SVG write moved off the event loop.
 
+### Fixed after the first deployment
+
+Restarting Home Assistant put the entry into `setup_retry` with
+`list index out of range`. `get_matter()` indexes into `hass.data["matter"]`,
+which is still empty if the Matter integration has not finished setting up, and
+`_get_matter_devices` caught `KeyError, StopIteration, AttributeError,
+ImportError` but not `IndexError` - so a race over what is only optional
+enrichment failed the entire update. It self-healed on retry, but recurred
+whenever Matter lost the race. `IndexError` is now caught, with a test that
+reproduces the original failure.
+
 ### Known follow-ups, deliberately out of scope
 
 - `_match_end_device` still matches children positionally. The JSON:API
