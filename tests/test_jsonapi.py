@@ -415,6 +415,42 @@ class TestUnidentifiedRouterNaming:
         assert result["manufacturer"] == "Apple"
 
 
+class TestAddressSuffixIdentification:
+    """Suffix matching must be anchored, not a substring search.
+
+    The rule was previously `"EA" in ext_address`, which labels roughly one
+    address in eighteen as an Eero.
+    """
+
+    def test_eero_suffix_is_identified(self, coordinator):
+        result = coordinator._identify_router("96308C2577D6EA17", False)
+
+        assert result["name"] == "Eero"
+        assert result["manufacturer"] == "Amazon/Eero"
+
+    def test_suffix_match_is_case_insensitive(self, coordinator):
+        assert coordinator._identify_router(
+            "96308c2577d6ea17", False
+        )["name"] == "Eero"
+
+    @pytest.mark.parametrize(
+        "ext_address",
+        [
+            "EA17000000000000",  # at the start
+            "0000EA1700000000",  # in the middle
+            "00000000000000EA",  # bare "EA" at the end
+            "12EA345678901234",  # bare "EA" in the middle
+            "6A57F823187E197B",  # the real leader on the dev network
+        ],
+    )
+    def test_unanchored_matches_are_rejected(self, coordinator, ext_address):
+        result = coordinator._identify_router(ext_address, False)
+
+        assert result["name"] != "Eero"
+        assert result["manufacturer"] != "Amazon/Eero"
+        assert result["name"].startswith("Thread Router ")
+
+
 class TestTransportGuess:
     """Fallback used only when a Matter node reports no interfaces."""
 
