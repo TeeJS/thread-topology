@@ -100,6 +100,12 @@ the label changed run to run as ordering shifted. Unidentified nodes are now
 named after their own address (`Thread Router 197B`) with manufacturer
 `Unknown`; `custom_routers.yaml` remains the way to supply a real name.
 
+`BORDER_ROUTER_PATTERNS` was the other half of the same problem: it matched the
+bare substring `EA` anywhere in an extended address and called the result an
+Eero, which fits roughly one address in eighteen. Suffix matching is now
+anchored to the end of the address and the bare `EA` entry is gone, leaving only
+the specific `EA17` ending that the original comment actually described.
+
 ### The "13 Matter Thread devices vs 3 mesh nodes" gap, resolved
 
 The mesh crawl was right; the Matter count was wrong.

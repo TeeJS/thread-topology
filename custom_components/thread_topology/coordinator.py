@@ -100,11 +100,15 @@ KNOWN_BORDER_ROUTER_OUIS = {
     "40:22:D8": {"name": "ESP32 Thread", "manufacturer": "Espressif", "icon": "chip"},
 }
 
-# Fallback patterns for partial matches
-BORDER_ROUTER_PATTERNS = [
-    # Pattern, name, manufacturer
+# Fallback identification by how an extended address ends.
+#
+# Anchored to the end of the address, and kept long enough to mean something.
+# An earlier version matched these as substrings anywhere in the address and
+# included the bare "EA", which labels roughly one address in eighteen as an
+# Eero - and did, on hardware that was nothing of the sort.
+BORDER_ROUTER_ADDRESS_SUFFIXES = [
+    # Suffix, name, manufacturer
     ("EA17", "Eero", "Amazon/Eero"),
-    ("EA", "Eero", "Amazon/Eero"),  # Eero addresses often end with EA17
 ]
 
 
@@ -926,9 +930,9 @@ class ThreadTopologyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                         "icon": info.get("icon", "router"),
                     }
 
-        # Check for pattern matches in the address
-        for pattern, name, manufacturer in BORDER_ROUTER_PATTERNS:
-            if pattern in ext_normalized:
+        # Check for a known address suffix. Anchored, not a substring search.
+        for suffix, name, manufacturer in BORDER_ROUTER_ADDRESS_SUFFIXES:
+            if ext_normalized.endswith(suffix):
                 return {
                     "name": name,
                     "manufacturer": manufacturer,
