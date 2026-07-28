@@ -25,6 +25,7 @@ sys.modules.setdefault("homeassistant.helpers.update_coordinator", MagicMock())
 from custom_components.thread_topology import coordinator as coordinator_module  # noqa: E402
 from custom_components.thread_topology.coordinator import (  # noqa: E402
     ThreadTopologyCoordinator,
+    _guess_transport,
     _link_margin_to_lqi,
     _parse_rloc,
     _translate_child_table,
@@ -412,6 +413,111 @@ class TestUnidentifiedRouterNaming:
         result = coordinator._identify_router("286D970123456789", False)
 
         assert result["manufacturer"] == "Apple"
+
+
+class TestTransportGuess:
+    """Fallback used only when a Matter node reports no interfaces."""
+
+    @pytest.mark.parametrize(
+        "model",
+        [
+            "Smart Wi-Fi Dimmer Switch",   # TP-Link: the hyphen defeated "wifi"
+            "Smart WiFi Plug",
+            "Smart Wi Fi Bulb",
+        ],
+    )
+    def test_recognises_wifi_spellings(self, model):
+        assert _guess_transport(model, "Kitchen light", "TP-Link") == "wifi"
+
+    def test_recognises_wifi_only_manufacturers(self):
+        assert _guess_transport("Smart Lock", "Front door", "Nuki") == "wifi"
+
+    @pytest.mark.parametrize(
+        ("model", "manufacturer"),
+        [
+            ("Smart RGBTW Bulb", "Leedarson"),
+            ("ALPSTUGA air quality monitor", "IKEA of Sweden"),
+            ("Shelly 1 Mini Gen3", "Shelly"),
+            (None, None),
+        ],
+    )
+    def test_never_claims_thread_without_evidence(self, model, manufacturer):
+        """Defaulting to Thread is what put Wi-Fi bulbs in the mesh."""
+        assert _guess_transport(model, "Some device", manufacturer) != "thread"
+
+    def test_unrecognised_is_unknown(self):
+        assert _guess_transport("Smart RGBTW Bulb", "Light", "Leedarson") == "unknown"
+
+
+class TestEndDeviceMatching:
+    """Children are matched on identity, never by position."""
+
+    THREAD_BUTTON = {
+        "name": "Bedroom BILRESA button",
+        "model": "BILRESA dual button",
+        "manufacturer": "IKEA of Sweden",
+        "transport": "thread",
+        "ext_address": "AABBCCDDEEFF0011",
+        "ip_addresses": ["fd00:1234:5678:9abc::5"],
+    }
+    WIFI_BULB = {
+        "name": "Print Farm Light 1",
+        "model": "Smart RGBTW Bulb",
+        "manufacturer": "Leedarson",
+        "transport": "wifi",
+        "ext_address": None,
+        "ip_addresses": [],
+    }
+    UNKNOWN_DEVICE = {
+        "name": "Mystery device",
+        "model": None,
+        "manufacturer": None,
+        "transport": "unknown",
+        "ext_address": None,
+        "ip_addresses": [],
+    }
+
+    @pytest.fixture
+    def devices(self) -> list[dict]:
+        # Wi-Fi bulb first: it is what positional matching used to pick.
+        return [self.WIFI_BULB, self.UNKNOWN_DEVICE, self.THREAD_BUTTON]
+
+    def test_matches_on_child_ext_address(self, coordinator, devices):
+        match = coordinator._match_end_device(devices, set(), "0a799b2bd2123f8f")
+
+        assert match is None  # not this address
+
+        match = coordinator._match_end_device(devices, set(), "aabbccddeeff0011")
+
+        assert match["name"] == "Bedroom BILRESA button"
+
+    def test_ext_address_match_is_case_insensitive(self, coordinator, devices):
+        match = coordinator._match_end_device(devices, set(), "AA:BB:CC:DD:EE:FF:00:11")
+
+        assert match["name"] == "Bedroom BILRESA button"
+
+    def test_matches_on_shared_ipv6(self, coordinator, devices):
+        match = coordinator._match_end_device(
+            devices, set(), None, ["fd00:1234:5678:9abc::5"]
+        )
+
+        assert match["name"] == "Bedroom BILRESA button"
+
+    def test_unidentifiable_child_is_left_unnamed(self, coordinator, devices):
+        """Previously returned the first unclaimed device - a Wi-Fi bulb."""
+        assert coordinator._match_end_device(devices, set()) is None
+
+    def test_never_returns_a_non_thread_device(self, coordinator, devices):
+        for ext in (None, "ffffffffffffffff"):
+            match = coordinator._match_end_device(devices, set(), ext)
+            assert match is None or match["transport"] == "thread"
+
+    def test_claimed_devices_are_skipped(self, coordinator, devices):
+        claimed = {"AABBCCDDEEFF0011"}
+
+        assert coordinator._match_end_device(
+            devices, claimed, "aabbccddeeff0011"
+        ) is None
 
 
 class TestMatterQueryFailures:

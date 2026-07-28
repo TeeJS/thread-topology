@@ -100,11 +100,32 @@ the label changed run to run as ordering shifted. Unidentified nodes are now
 named after their own address (`Thread Router 197B`) with manufacturer
 `Unknown`; `custom_routers.yaml` remains the way to supply a real name.
 
-### Known follow-ups, deliberately out of scope
+### The "13 Matter Thread devices vs 3 mesh nodes" gap, resolved
 
-- `_match_end_device` still matches children positionally. The JSON:API
-  `children[]` array carries each child's real extended address, which would
-  make that matching exact.
-- Home Assistant knows 13 Matter Thread devices while the mesh crawl reports
-  3 nodes. Unexplained; may need the `deviceCount` / `maxAge` crawl parameters
-  revisited, or those devices may simply be offline.
+The mesh crawl was right; the Matter count was wrong.
+
+Transport was guessed from strings: `"wifi" in model`, plus a three-name
+manufacturer allowlist, defaulting to Thread. TP-Link's model reads "Smart
+**Wi-Fi** Dimmer Switch" - hyphenated, so the test never fired - and Leedarson,
+Sciener and Shelly are not in the allowlist. Every Matter device therefore
+defaulted to Thread, giving "13 Thread + 0 Wi-Fi" against a true split of 5 and
+8. Of those 5 Thread devices only 2 were online, which together with the OTBR
+is exactly the 3 nodes the crawl reported.
+
+Transport now comes from the node's own `GeneralDiagnostics.NetworkInterfaces`
+interface type. The string heuristic survives only as a fallback for nodes that
+report no interfaces, and it can no longer return "thread" - an honest
+"unknown" keeps a device out of the topology rather than inventing a place for
+it in the mesh.
+
+That misclassification also fed the child matcher, which handed out "the next
+unclaimed Thread device" positionally and so labelled the border router's child
+as a Leedarson Wi-Fi bulb that was offline at the time. Children are now matched
+on identity only - extended address, else shared IPv6 - and an unidentifiable
+child is left unnamed. Verified against the live network: matter-server reports
+the real child's MAC as `0a:79:9b:2b:d2:12:3f:8f`, matching the extended
+address OTBR reports for it exactly.
+
+Device names now prefer `name_by_user` over `name`, so renames made in Home
+Assistant are respected. Both of this network's air quality monitors carry the
+same factory name, which made the map ambiguous about which one it was showing.
