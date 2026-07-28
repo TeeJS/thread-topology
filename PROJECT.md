@@ -135,3 +135,23 @@ address OTBR reports for it exactly.
 Device names now prefer `name_by_user` over `name`, so renames made in Home
 Assistant are respected. Both of this network's air quality monitors carry the
 same factory name, which made the map ambiguous about which one it was showing.
+
+### Matter identity now comes from matter-server, not cached cluster attributes
+
+Making the above honest exposed the layer underneath. `_get_matter_devices`
+read each node's MAC and radio from cached
+`GeneralDiagnostics.NetworkInterfaces` attributes, with a comment explaining
+that it did so to stay synchronous. For battery powered sleepy end devices that
+attribute is unreliable - absent after a restart, intermittent afterwards - so
+the extended address came and went, and every name matched from it went with
+it. The child of the border router flickered between its real name and nothing,
+and after one restart the whole Matter count sat at "0 Thread" for minutes.
+matter-server's `node_diagnostics()` had the data the entire time; it is what
+Home Assistant's own Matter device page shows.
+
+The method is now async - it is only ever called from `_async_update_data`,
+which already was - and awaits `matter_client.node_diagnostics()` per node,
+concurrently, each bounded by `MATTER_NODE_TIMEOUT` so an unreachable node
+cannot stall an update. That call returns `network_type` directly, so the radio
+is read rather than inferred, and the `chip.clusters` and `base64` imports are
+gone entirely.

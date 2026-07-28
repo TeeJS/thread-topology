@@ -39,6 +39,7 @@ from .const import (
     ENDPOINT_DIAGNOSTICS,
     ENDPOINT_NODE,
     JSONAPI_SCAN_INTERVAL,
+    MATTER_NODE_TIMEOUT,
     REQUEST_TIMEOUT,
     ROUTING_ROLES,
     TASK_POLL_INTERVAL,
@@ -130,8 +131,38 @@ def _normalize_address(address: str) -> str:
     return address.replace(":", "").replace("-", "").replace(" ", "").upper()
 
 
+def _enum_value(value: Any) -> Any:
+    """Unwrap an Enum to its value, leaving plain values alone."""
+    return getattr(value, "value", value)
+
+
+def _parse_node_diagnostics(diagnostics: Any) -> dict[str, Any]:
+    """Pull what we need out of a matter-server NodeDiagnostics.
+
+    Read defensively: this crosses a library boundary, and the field holding the
+    IP list is spelled "ip_adresses" upstream - the kind of thing that gets
+    corrected without warning.
+    """
+    transport = _enum_value(getattr(diagnostics, "network_type", None))
+    transport = str(transport).lower() if transport is not None else TRANSPORT_UNKNOWN
+
+    node_type = _enum_value(getattr(diagnostics, "node_type", None))
+
+    addresses = getattr(diagnostics, "ip_adresses", None)
+    if addresses is None:
+        addresses = getattr(diagnostics, "ip_addresses", None)
+
+    return {
+        "transport": transport,
+        "mac_address": getattr(diagnostics, "mac_address", None),
+        "ip_addresses": list(addresses) if isinstance(addresses, (list, tuple)) else [],
+        "available": bool(getattr(diagnostics, "available", True)),
+        "node_type": str(node_type).lower() if node_type is not None else None,
+    }
+
+
 def _guess_transport(model: str | None, name: str | None, manufacturer: str | None) -> str:
-    """Guess a device's radio when its Matter node reported no interfaces.
+    """Guess a device's radio when matter-server reported nothing for the node.
 
     Deliberately never returns "thread". Assuming Thread by default is what put
     Wi-Fi bulbs into the mesh as Thread children; an honest "unknown" keeps them
@@ -488,7 +519,7 @@ class ThreadTopologyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             diagnostics_data = await self._fetch_diagnostics()
 
             # Get Matter devices from HA device registry
-            matter_devices = self._get_matter_devices()
+            matter_devices = await self._async_get_matter_devices()
 
             # Get Thread Border Routers from HA device registry
             thread_routers = self._get_thread_border_routers()
@@ -699,106 +730,17 @@ class ThreadTopologyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         raise OtbrTaskError(f"task '{label}' timed out after {TASK_TIMEOUT}s")
 
-    def _get_matter_devices(self) -> list[dict[str, Any]]:
+    async def _async_get_matter_devices(self) -> list[dict[str, Any]]:
         """Get Matter devices from Home Assistant device registry.
 
-        Also pulls each device's Thread Extended Address (EUI-64) and current
-        IPv6 addresses from matter-server's NodeDiagnostics, so that downstream
-        matching can use the actual hardware address instead of iteration order.
+        Each device is annotated with the radio it is actually on and, for
+        Thread devices, its extended address (EUI-64), so that downstream
+        matching can key on hardware identity rather than iteration order.
         """
         device_registry = dr.async_get(self.hass)
         matter_devices = []
 
-        # Build {node_id: (mac_address, [ip_addresses])} from matter-server, if available.
-        # We read this synchronously from cached cluster attributes rather than
-        # calling the async client.node_diagnostics(), because we're in a sync method.
-        node_info_by_id: dict[int, tuple[str | None, list[str]]] = {}
-        if _MATTER_AVAILABLE:
-            try:
-                # Lazy-import here so this module still imports if Matter integration
-                # is missing optional deps in some HA setups.
-                import base64  # noqa: PLC0415
-                from chip.clusters import Objects as Clusters  # noqa: PLC0415
-
-                matter_adapter = get_matter(self.hass)
-                attribute = Clusters.GeneralDiagnostics.Attributes.NetworkInterfaces
-                thread_iface_type = (
-                    Clusters.GeneralDiagnostics.Enums.InterfaceTypeEnum.kThread
-                )
-                wifi_iface_type = (
-                    Clusters.GeneralDiagnostics.Enums.InterfaceTypeEnum.kWiFi
-                )
-
-                for node in matter_adapter.matter_client.get_nodes():
-                    mac: str | None = None
-                    interfaces = node.get_attribute_value(
-                        0, cluster=None, attribute=attribute
-                    ) or []
-
-                    # Which radio the node actually uses. This is the device's
-                    # own report, and the only trustworthy source - guessing it
-                    # from model names put Wi-Fi bulbs in the Thread mesh.
-                    transport: str | None = None
-                    for iface in interfaces:
-                        if not getattr(iface, "isOperational", True):
-                            continue
-                        iface_type = getattr(iface, "type", None)
-                        if iface_type == thread_iface_type:
-                            transport = TRANSPORT_THREAD
-                            break
-                        if iface_type == wifi_iface_type and transport is None:
-                            transport = TRANSPORT_WIFI
-
-                    for iface in interfaces:
-                        # Find the operational Thread interface (or fall back to
-                        # any operational one if no Thread interface present).
-                        if not getattr(iface, "isOperational", True):
-                            continue
-                        hw_addr = getattr(iface, "hardwareAddress", None)
-                        if not hw_addr:
-                            continue
-                        # convert_mac_address logic: base64-decode if str, then
-                        # format as colon-separated hex.
-                        if isinstance(hw_addr, str):
-                            try:
-                                hw_addr = base64.b64decode(hw_addr)
-                            except (ValueError, TypeError):
-                                continue
-                        try:
-                            mac = ":".join(f"{b:02x}" for b in hw_addr)
-                        except (TypeError, ValueError):
-                            continue
-                        # Prefer the Thread interface if there is one; otherwise
-                        # take the first operational interface we find.
-                        if getattr(iface, "type", None) == thread_iface_type:
-                            break
-
-                    # IPs come from the same NetworkInterfaces struct.
-                    ips: list[str] = []
-                    for iface in interfaces:
-                        for ip_bytes in getattr(iface, "iPv6Addresses", []) or []:
-                            if isinstance(ip_bytes, str):
-                                try:
-                                    ip_bytes = base64.b64decode(ip_bytes)
-                                except (ValueError, TypeError):
-                                    continue
-                            # Format raw 16-byte IPv6 as standard string.
-                            if isinstance(ip_bytes, (bytes, bytearray)) and len(ip_bytes) == 16:
-                                import ipaddress  # noqa: PLC0415
-                                try:
-                                    ips.append(str(ipaddress.IPv6Address(bytes(ip_bytes))))
-                                except (ValueError, TypeError):
-                                    pass
-
-                    node_info_by_id[node.node_id] = (mac, ips, transport)
-            # IndexError covers get_matter() indexing into hass.data["matter"]
-            # before the Matter integration has finished setting up - a restart
-            # race that would otherwise fail the whole update over what is only
-            # optional enrichment.
-            except (
-                KeyError, IndexError, StopIteration, AttributeError, ImportError
-            ) as err:
-                _LOGGER.debug("Could not query Matter client for node diagnostics: %s", err)
+        diagnostics_by_node = await self._async_matter_node_diagnostics()
 
         for device in device_registry.devices.values():
             # Find the "matter" identifier on this device, if any.
@@ -814,28 +756,24 @@ class ThreadTopologyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             # factory name, which is identical across two of the same product.
             name = device.name_by_user or device.name or "Unknown"
 
-            # Look up mac/IPs/transport by parsing the node ID out of the Matter
-            # identifier. HA stores it as e.g.
+            # Match the registry entry to its Matter node by parsing the node id
+            # out of the identifier, stored as
             # "deviceid_<fabric_hex>-<node_hex>-MatterNodeDevice".
-            mac_address: str | None = None
-            ip_addresses: list[str] = []
-            node_transport: str | None = None
+            diagnostics: dict[str, Any] = {}
             try:
-                # Strip the leading type prefix and split on dashes.
-                # node_id is the second hex segment.
                 stripped = matter_identifier_value
                 if stripped.startswith("deviceid_"):
                     stripped = stripped[len("deviceid_"):]
                 parts = stripped.split("-")
                 if len(parts) >= 2:
-                    node_id = int(parts[1], 16)
-                    if node_id in node_info_by_id:
-                        mac_address, ip_addresses, node_transport = node_info_by_id[node_id]
+                    diagnostics = diagnostics_by_node.get(int(parts[1], 16), {})
             except (ValueError, IndexError):
                 pass
 
-            # Prefer what the node reported; only guess if it told us nothing.
-            transport = node_transport or _guess_transport(
+            mac_address = diagnostics.get("mac_address")
+
+            # Only guess the radio if matter-server told us nothing at all.
+            transport = diagnostics.get("transport") or _guess_transport(
                 device.model, name, device.manufacturer
             )
 
@@ -846,10 +784,58 @@ class ThreadTopologyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 "identifiers": list(device.identifiers),
                 "transport": transport,
                 "ext_address": _normalize_address(mac_address) if mac_address else None,
-                "ip_addresses": ip_addresses,
+                "ip_addresses": diagnostics.get("ip_addresses", []),
+                "available": diagnostics.get("available"),
+                "node_type": diagnostics.get("node_type"),
             })
 
         return matter_devices
+
+    async def _async_matter_node_diagnostics(self) -> dict[int, dict[str, Any]]:
+        """Ask matter-server for per-node diagnostics, keyed by node id.
+
+        This is the same source Home Assistant's own Matter device page uses.
+        An earlier implementation read GeneralDiagnostics.NetworkInterfaces from
+        cached cluster attributes to stay synchronous, but that attribute is
+        unreliable for battery powered sleepy end devices: their MAC address
+        came and went between updates, and every name matched from it went with
+        it. This method is async, which is what let us stop doing that.
+        """
+        if not _MATTER_AVAILABLE:
+            return {}
+
+        try:
+            matter_client = get_matter(self.hass).matter_client
+            nodes = list(matter_client.get_nodes())
+        # IndexError covers get_matter() indexing into hass.data["matter"]
+        # before the Matter integration has finished setting up - a restart
+        # race that would otherwise fail the whole update over what is only
+        # optional enrichment.
+        except (KeyError, IndexError, StopIteration, AttributeError) as err:
+            _LOGGER.debug("Matter client not available: %s", err)
+            return {}
+
+        async def fetch(node: Any) -> tuple[int, dict[str, Any]] | None:
+            node_id = getattr(node, "node_id", None)
+            if node_id is None:
+                return None
+            try:
+                diagnostics = await asyncio.wait_for(
+                    matter_client.node_diagnostics(node_id=node_id),
+                    timeout=MATTER_NODE_TIMEOUT,
+                )
+            except Exception as err:  # noqa: BLE001 - one node must not fail the update
+                _LOGGER.debug("No Matter diagnostics for node %s: %s", node_id, err)
+                return None
+            return node_id, _parse_node_diagnostics(diagnostics)
+
+        results = await asyncio.gather(*(fetch(node) for node in nodes))
+        by_node = {node_id: data for node_id, data in filter(None, results)}
+
+        _LOGGER.debug(
+            "Matter diagnostics: %d/%d node(s) reported", len(by_node), len(nodes)
+        )
+        return by_node
 
     def _get_thread_border_routers(self) -> list[dict[str, Any]]:
         """Get Thread Border Routers from Home Assistant device registry."""

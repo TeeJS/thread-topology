@@ -42,6 +42,10 @@ TASK_POLL_INTERVAL = 0.75
 TASK_TIMEOUT = 120
 REQUEST_TIMEOUT = 15
 
+# Per-node budget for matter-server diagnostics. That call reaches out over the
+# network, so an unreachable node must not be able to stall the whole update.
+MATTER_NODE_TIMEOUT = 10
+
 # Attributes for the mesh crawl that populates /api/devices.
 DEVICE_COLLECTION_ATTRS = {
     "maxAge": 30,
