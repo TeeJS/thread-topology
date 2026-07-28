@@ -159,6 +159,23 @@ An earlier reading of this blamed cached `GeneralDiagnostics.NetworkInterfaces`
 attributes being unreliable for sleepy end devices. That was wrong - matter-server
 was reporting the device correctly the whole time.
 
+### Matter is now set up before this integration polls
+
+The identifier fix was necessary but not sufficient: restarts still produced a
+degraded first snapshot. The Matter integration finished setting up at
+`03:14:40` while this integration had already run its first poll, so no Matter
+device had an identity yet, and with a 180s interval that snapshot stood for
+three minutes before the next poll corrected it. Once Matter is up, every node
+answers - `Matter diagnostics: 15/15 node(s) reported`.
+
+`after_dependencies: ["matter"]` in the manifest is Home Assistant's mechanism
+for exactly this, and is the right one here rather than `dependencies`: Matter
+is optional enrichment and the integration must still load without it.
+
+A node's last known identity is also remembered now. A MAC and a radio are
+stable facts, so a node that misses one update no longer drops its extended
+address and take every name matched from it off the map.
+
 ### Matter identity now comes from matter-server, not cached cluster attributes
 
 Independently worth doing, and done at the same time. `_get_matter_devices`
