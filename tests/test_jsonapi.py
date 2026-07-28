@@ -7,8 +7,11 @@ wrong in the same way the code did.
 """
 from __future__ import annotations
 
+import asyncio
 import sys
+import time
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -27,6 +30,7 @@ from custom_components.thread_topology.coordinator import (  # noqa: E402
     ThreadTopologyCoordinator,
     _guess_transport,
     _link_margin_to_lqi,
+    _parse_node_diagnostics,
     _parse_rloc,
     _translate_child_table,
     _translate_diagnostic,
@@ -556,28 +560,195 @@ class TestEndDeviceMatching:
         ) is None
 
 
-class TestMatterQueryFailures:
-    """Matter data is optional enrichment; a failure must not fail the update.
+class TestParseNodeDiagnostics:
+    """Reading matter-server's NodeDiagnostics across a library boundary."""
 
-    The IndexError case is a real restart race: Home Assistant's get_matter()
-    indexes into hass.data["matter"], which is still empty if the Matter
-    integration has not finished setting up. It put the config entry into
-    setup_retry with "list index out of range".
+    @staticmethod
+    def _enum(value):
+        return SimpleNamespace(value=value)
+
+    def _diagnostics(self, **overrides):
+        base = SimpleNamespace(
+            node_id=87,
+            network_type=self._enum("thread"),
+            node_type=self._enum("sleepy_end_device"),
+            network_name="ha-thread-0d68",
+            ip_adresses=["fd00:1234:5678:9abc::5"],
+            mac_address="0a:79:9b:2b:d2:12:3f:8f",
+            available=True,
+        )
+        for key, value in overrides.items():
+            setattr(base, key, value)
+        return base
+
+    def test_unwraps_enums(self):
+        parsed = _parse_node_diagnostics(self._diagnostics())
+
+        assert parsed["transport"] == "thread"
+        assert parsed["node_type"] == "sleepy_end_device"
+
+    def test_accepts_a_plain_string_network_type(self):
+        parsed = _parse_node_diagnostics(self._diagnostics(network_type="wifi"))
+
+        assert parsed["transport"] == "wifi"
+
+    def test_reads_the_upstream_misspelled_ip_field(self):
+        """python-matter-server spells the field "ip_adresses"."""
+        parsed = _parse_node_diagnostics(self._diagnostics())
+
+        assert parsed["ip_addresses"] == ["fd00:1234:5678:9abc::5"]
+
+    def test_reads_the_field_if_upstream_corrects_the_spelling(self):
+        diagnostics = self._diagnostics()
+        del diagnostics.ip_adresses
+        diagnostics.ip_addresses = ["fd00::2"]
+
+        assert _parse_node_diagnostics(diagnostics)["ip_addresses"] == ["fd00::2"]
+
+    def test_mac_address_is_passed_through(self):
+        parsed = _parse_node_diagnostics(self._diagnostics())
+
+        assert parsed["mac_address"] == "0a:79:9b:2b:d2:12:3f:8f"
+
+    def test_availability_is_captured(self):
+        assert _parse_node_diagnostics(self._diagnostics(available=False))["available"] is False
+
+    def test_missing_fields_do_not_raise(self):
+        parsed = _parse_node_diagnostics(SimpleNamespace())
+
+        assert parsed["transport"] == "unknown"
+        assert parsed["mac_address"] is None
+        assert parsed["ip_addresses"] == []
+
+
+class TestMatterDeviceCollection:
+    """Building the Matter device list from matter-server diagnostics.
+
+    The sleepy end device below is the real failure this replaced: its MAC was
+    read from cached GeneralDiagnostics cluster attributes, which come and go
+    for battery devices, so the child's name flickered in and out of the map.
     """
 
-    @pytest.fixture
-    def matter_ready(self, coordinator, monkeypatch) -> ThreadTopologyCoordinator:
-        """Make the Matter branch reachable without Home Assistant installed."""
-        monkeypatch.setitem(sys.modules, "chip", MagicMock())
-        monkeypatch.setitem(sys.modules, "chip.clusters", MagicMock())
-        monkeypatch.setattr(coordinator_module, "_MATTER_AVAILABLE", True)
+    IDENTIFIER = "deviceid_9DEA92C0F9B67B5E-0000000000000057-MatterNodeDevice"
+    NODE_ID = 0x57
 
-        registry = MagicMock()
-        registry.devices.values.return_value = []
-        monkeypatch.setattr(
-            coordinator_module.dr, "async_get", lambda hass: registry
+    @pytest.fixture
+    def registry_device(self):
+        return SimpleNamespace(
+            identifiers={("matter", self.IDENTIFIER)},
+            name="BILRESA dual button",
+            name_by_user="Bedroom BILRESA button",
+            model="BILRESA dual button",
+            manufacturer="IKEA of Sweden",
         )
+
+    @pytest.fixture
+    def wired(self, coordinator, monkeypatch, registry_device):
+        monkeypatch.setattr(coordinator_module, "_MATTER_AVAILABLE", True)
+        registry = MagicMock()
+        registry.devices.values.return_value = [registry_device]
+        monkeypatch.setattr(coordinator_module.dr, "async_get", lambda hass: registry)
         return coordinator
+
+    def _install_client(self, monkeypatch, node_diagnostics, node_ids=(NODE_ID,)):
+        client = MagicMock()
+        client.get_nodes.return_value = [
+            SimpleNamespace(node_id=node_id) for node_id in node_ids
+        ]
+        client.node_diagnostics = node_diagnostics
+        monkeypatch.setattr(
+            coordinator_module,
+            "get_matter",
+            lambda hass: SimpleNamespace(matter_client=client),
+            raising=False,
+        )
+
+    async def test_thread_device_is_fully_resolved(self, wired, monkeypatch):
+        async def node_diagnostics(node_id):
+            assert node_id == self.NODE_ID
+            return SimpleNamespace(
+                network_type=SimpleNamespace(value="thread"),
+                node_type=SimpleNamespace(value="sleepy_end_device"),
+                ip_adresses=["fd00::5"],
+                mac_address="0a:79:9b:2b:d2:12:3f:8f",
+                available=True,
+            )
+
+        self._install_client(monkeypatch, node_diagnostics)
+
+        devices = await wired._async_get_matter_devices()
+
+        assert len(devices) == 1
+        assert devices[0]["transport"] == "thread"
+        assert devices[0]["ext_address"] == "0A799B2BD2123F8F"
+        assert devices[0]["available"] is True
+
+    async def test_user_assigned_name_wins(self, wired, monkeypatch):
+        async def node_diagnostics(node_id):
+            return SimpleNamespace(
+                network_type=SimpleNamespace(value="thread"),
+                mac_address="0a:79:9b:2b:d2:12:3f:8f",
+            )
+
+        self._install_client(monkeypatch, node_diagnostics)
+
+        devices = await wired._async_get_matter_devices()
+
+        assert devices[0]["name"] == "Bedroom BILRESA button"
+
+    async def test_falls_back_when_a_node_reports_nothing(self, wired, monkeypatch):
+        """The device still appears, without an invented Thread membership."""
+        async def node_diagnostics(node_id):
+            raise RuntimeError("node unreachable")
+
+        self._install_client(monkeypatch, node_diagnostics)
+
+        devices = await wired._async_get_matter_devices()
+
+        assert len(devices) == 1
+        assert devices[0]["ext_address"] is None
+        assert devices[0]["transport"] == "unknown"
+
+    async def test_a_hanging_node_cannot_stall_the_update(self, wired, monkeypatch):
+        """node_diagnostics reaches over the network; it must be bounded."""
+        monkeypatch.setattr(coordinator_module, "MATTER_NODE_TIMEOUT", 0.05)
+
+        async def node_diagnostics(node_id):
+            await asyncio.sleep(30)
+
+        self._install_client(monkeypatch, node_diagnostics)
+
+        started = time.monotonic()
+        devices = await wired._async_get_matter_devices()
+        elapsed = time.monotonic() - started
+
+        # Unbounded, this would sit here for 30 seconds holding up the update.
+        assert elapsed < 5
+        assert len(devices) == 1
+        assert devices[0]["ext_address"] is None
+
+    async def test_one_slow_node_does_not_lose_the_others(self, wired, monkeypatch):
+        """Nodes are fetched concurrently, each with its own budget."""
+        monkeypatch.setattr(coordinator_module, "MATTER_NODE_TIMEOUT", 0.05)
+
+        async def node_diagnostics(node_id):
+            if node_id != self.NODE_ID:
+                await asyncio.sleep(30)
+            return SimpleNamespace(
+                network_type=SimpleNamespace(value="thread"),
+                mac_address="0a:79:9b:2b:d2:12:3f:8f",
+            )
+
+        self._install_client(
+            monkeypatch, node_diagnostics, node_ids=(0x99, self.NODE_ID, 0x98)
+        )
+
+        started = time.monotonic()
+        devices = await wired._async_get_matter_devices()
+        elapsed = time.monotonic() - started
+
+        assert elapsed < 5
+        assert devices[0]["ext_address"] == "0A799B2BD2123F8F"
 
     @pytest.mark.parametrize(
         "error",
@@ -586,10 +757,10 @@ class TestMatterQueryFailures:
             KeyError("matter"),
             StopIteration(),
             AttributeError("adapter"),
-            ImportError("chip"),
         ],
     )
-    def test_survives_matter_client_errors(self, matter_ready, monkeypatch, error):
+    async def test_survives_matter_client_errors(self, wired, monkeypatch, error):
+        """get_matter() raced the Matter integration's setup and blew up."""
         monkeypatch.setattr(
             coordinator_module,
             "get_matter",
@@ -597,7 +768,19 @@ class TestMatterQueryFailures:
             raising=False,
         )
 
-        assert matter_ready._get_matter_devices() == []
+        devices = await wired._async_get_matter_devices()
+
+        assert len(devices) == 1
+        assert devices[0]["transport"] == "unknown"
+
+    async def test_no_matter_integration_at_all(self, coordinator, monkeypatch):
+        monkeypatch.setattr(coordinator_module, "_MATTER_AVAILABLE", False)
+        registry = MagicMock()
+        registry.devices.values.return_value = []
+        monkeypatch.setattr(coordinator_module.dr, "async_get", lambda hass: registry)
+
+        assert await coordinator._async_get_matter_devices() == []
+
 
 
 class TestSvgWriting:
