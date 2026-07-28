@@ -483,6 +483,10 @@ class ThreadTopologyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._router_index = 0  # Track router numbering
         self._custom_routers: list[dict[str, str]] = self._load_custom_routers()
         self._api_mode = API_MODE_UNKNOWN
+        # Last known Matter identity per node. A node's MAC and radio are
+        # stable facts, so remembering them keeps names on the map when
+        # matter-server is briefly unable to answer.
+        self._matter_node_cache: dict[int, dict[str, Any]] = {}
 
     def _load_custom_routers(self) -> list[dict[str, str]]:
         """Load user-defined border routers from custom_routers.yaml."""
@@ -828,7 +832,7 @@ class ThreadTopologyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # optional enrichment.
         except (KeyError, IndexError, StopIteration, AttributeError) as err:
             _LOGGER.debug("Matter client not available: %s", err)
-            return {}
+            return dict(self._matter_node_cache)
 
         async def fetch(node: Any) -> tuple[int, dict[str, Any]] | None:
             node_id = getattr(node, "node_id", None)
@@ -847,10 +851,17 @@ class ThreadTopologyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         results = await asyncio.gather(*(fetch(node) for node in nodes))
         by_node = {node_id: data for node_id, data in filter(None, results)}
 
+        # Keep what a node last told us. Otherwise a node that goes quiet for
+        # one update drops its extended address, and every name matched from
+        # it disappears from the map until it answers again.
+        self._matter_node_cache.update(by_node)
+        merged = dict(self._matter_node_cache)
+
         _LOGGER.debug(
-            "Matter diagnostics: %d/%d node(s) reported", len(by_node), len(nodes)
+            "Matter diagnostics: %d/%d node(s) reported, %d known in total",
+            len(by_node), len(nodes), len(merged),
         )
-        return by_node
+        return merged
 
     def _get_thread_border_routers(self) -> list[dict[str, Any]]:
         """Get Thread Border Routers from Home Assistant device registry."""

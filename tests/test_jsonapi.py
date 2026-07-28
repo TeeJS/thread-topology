@@ -8,6 +8,7 @@ wrong in the same way the code did.
 from __future__ import annotations
 
 import asyncio
+import json
 import sys
 import time
 from pathlib import Path
@@ -561,6 +562,27 @@ class TestEndDeviceMatching:
         ) is None
 
 
+class TestManifest:
+    """Startup ordering is declared in the manifest, not in code."""
+
+    @pytest.fixture
+    def manifest(self) -> dict:
+        path = (
+            Path(__file__).parent.parent
+            / "custom_components" / "thread_topology" / "manifest.json"
+        )
+        return json.loads(path.read_text(encoding="utf-8"))
+
+    def test_matter_is_set_up_first(self, manifest):
+        """Our first poll otherwise runs before Matter has any devices.
+
+        after_dependencies, not dependencies: Matter is optional enrichment and
+        the integration must still load without it.
+        """
+        assert "matter" in manifest["after_dependencies"]
+        assert "matter" not in manifest["dependencies"]
+
+
 class TestMatterNodeId:
     """A Matter device carries several identifiers, in a set.
 
@@ -817,6 +839,47 @@ class TestMatterDeviceCollection:
 
         assert len(devices) == 1
         assert devices[0]["transport"] == "unknown"
+
+    async def test_identity_survives_a_node_going_quiet(self, wired, monkeypatch):
+        """A node that misses one update must not lose its name on the map."""
+        async def answering(node_id):
+            return SimpleNamespace(
+                network_type=SimpleNamespace(value="thread"),
+                mac_address="0a:79:9b:2b:d2:12:3f:8f",
+            )
+
+        self._install_client(monkeypatch, answering)
+        first = await wired._async_get_matter_devices()
+        assert first[0]["ext_address"] == "0A799B2BD2123F8F"
+
+        async def silent(node_id):
+            raise RuntimeError("no answer")
+
+        self._install_client(monkeypatch, silent)
+        second = await wired._async_get_matter_devices()
+
+        assert second[0]["ext_address"] == "0A799B2BD2123F8F"
+        assert second[0]["transport"] == "thread"
+
+    async def test_identity_survives_matter_going_away(self, wired, monkeypatch):
+        async def answering(node_id):
+            return SimpleNamespace(
+                network_type=SimpleNamespace(value="thread"),
+                mac_address="0a:79:9b:2b:d2:12:3f:8f",
+            )
+
+        self._install_client(monkeypatch, answering)
+        await wired._async_get_matter_devices()
+
+        monkeypatch.setattr(
+            coordinator_module,
+            "get_matter",
+            MagicMock(side_effect=IndexError("list index out of range")),
+            raising=False,
+        )
+        devices = await wired._async_get_matter_devices()
+
+        assert devices[0]["ext_address"] == "0A799B2BD2123F8F"
 
     async def test_no_matter_integration_at_all(self, coordinator, monkeypatch):
         monkeypatch.setattr(coordinator_module, "_MATTER_AVAILABLE", False)
