@@ -136,22 +136,36 @@ Device names now prefer `name_by_user` over `name`, so renames made in Home
 Assistant are respected. Both of this network's air quality monitors carry the
 same factory name, which made the map ambiguous about which one it was showing.
 
+### Why Matter device identity flickered between restarts
+
+Making the above honest exposed a bug that had been masked all along: Matter
+devices kept losing their identity from one restart to the next, so the child's
+name and the Thread device count changed for no visible reason.
+
+The cause was identifier selection. A Matter device carries more than one
+`matter` identifier - a `deviceid_<fabric>-<node>-MatterNodeDevice` and a
+`serial_<serial>` - and `device.identifiers` is a **set**. The code read
+whichever came out first and stopped. Python randomises string hashing per
+process, so a different identifier won on each start, and whenever the serial
+won there was no node id to parse, the device silently got no diagnostics, and
+every name and radio derived from it vanished. Only the `deviceid` form is
+parsed now, so a serial containing a dash cannot be mistaken for one either.
+
+Demonstrated rather than argued: with the old "first identifier wins" logic the
+tests fail under `PYTHONHASHSEED` 1, 5 and 6 and pass under 0, 2, 3, 4, 7, 8, 9
+and 12345. With the fix every seed passes.
+
+An earlier reading of this blamed cached `GeneralDiagnostics.NetworkInterfaces`
+attributes being unreliable for sleepy end devices. That was wrong - matter-server
+was reporting the device correctly the whole time.
+
 ### Matter identity now comes from matter-server, not cached cluster attributes
 
-Making the above honest exposed the layer underneath. `_get_matter_devices`
-read each node's MAC and radio from cached
-`GeneralDiagnostics.NetworkInterfaces` attributes, with a comment explaining
-that it did so to stay synchronous. For battery powered sleepy end devices that
-attribute is unreliable - absent after a restart, intermittent afterwards - so
-the extended address came and went, and every name matched from it went with
-it. The child of the border router flickered between its real name and nothing,
-and after one restart the whole Matter count sat at "0 Thread" for minutes.
-matter-server's `node_diagnostics()` had the data the entire time; it is what
-Home Assistant's own Matter device page shows.
-
-The method is now async - it is only ever called from `_async_update_data`,
-which already was - and awaits `matter_client.node_diagnostics()` per node,
-concurrently, each bounded by `MATTER_NODE_TIMEOUT` so an unreachable node
-cannot stall an update. That call returns `network_type` directly, so the radio
-is read rather than inferred, and the `chip.clusters` and `base64` imports are
-gone entirely.
+Independently worth doing, and done at the same time. `_get_matter_devices`
+read each node's MAC and radio from cached cluster attributes, with a comment
+explaining that it did so to stay synchronous. The method is now async - it is
+only ever called from `_async_update_data`, which already was - and awaits
+`matter_client.node_diagnostics()` per node, concurrently, each bounded by
+`MATTER_NODE_TIMEOUT` so an unreachable node cannot stall an update. That call
+returns `network_type` directly, so the radio is read rather than inferred, and
+the `chip.clusters` and `base64` imports are gone entirely.

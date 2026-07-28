@@ -30,6 +30,7 @@ from custom_components.thread_topology.coordinator import (  # noqa: E402
     ThreadTopologyCoordinator,
     _guess_transport,
     _link_margin_to_lqi,
+    _matter_node_id,
     _parse_node_diagnostics,
     _parse_rloc,
     _translate_child_table,
@@ -560,6 +561,48 @@ class TestEndDeviceMatching:
         ) is None
 
 
+class TestMatterNodeId:
+    """A Matter device carries several identifiers, in a set.
+
+    Reading "the first" one picked a different identifier between processes.
+    Whenever it landed on the serial, the device lost its diagnostics entirely -
+    which is what made names and Thread counts flicker across restarts.
+    """
+
+    DEVICE_ID = "deviceid_9DEA92C0F9B67B5E-0000000000000057-MatterNodeDevice"
+    SERIAL_ID = "serial_1035970000189A08"
+
+    def test_finds_the_node_id(self):
+        assert _matter_node_id([self.DEVICE_ID]) == 0x57
+
+    @pytest.mark.parametrize(
+        "identifiers",
+        [
+            (DEVICE_ID, SERIAL_ID),
+            (SERIAL_ID, DEVICE_ID),
+        ],
+    )
+    def test_order_does_not_matter(self, identifiers):
+        assert _matter_node_id(identifiers) == 0x57
+
+    def test_real_identifier_set(self):
+        """The set ordering is exactly what used to decide this."""
+        assert _matter_node_id({self.DEVICE_ID, self.SERIAL_ID}) == 0x57
+
+    def test_serial_alone_yields_nothing(self):
+        assert _matter_node_id([self.SERIAL_ID]) is None
+
+    def test_a_serial_containing_a_dash_is_not_parsed_as_a_node_id(self):
+        """Only the deviceid form is parsed, so this cannot be misread."""
+        assert _matter_node_id(["serial_ABC-DEF"]) is None
+
+    def test_unparseable_node_segment(self):
+        assert _matter_node_id(["deviceid_FABRIC-NOTHEX-MatterNodeDevice"]) is None
+
+    def test_no_identifiers(self):
+        assert _matter_node_id([]) is None
+
+
 class TestParseNodeDiagnostics:
     """Reading matter-server's NodeDiagnostics across a library boundary."""
 
@@ -630,12 +673,14 @@ class TestMatterDeviceCollection:
     """
 
     IDENTIFIER = "deviceid_9DEA92C0F9B67B5E-0000000000000057-MatterNodeDevice"
+    SERIAL = "serial_1035970000189A08"
     NODE_ID = 0x57
 
     @pytest.fixture
     def registry_device(self):
+        # Both identifiers, in a set, exactly as Home Assistant stores them.
         return SimpleNamespace(
-            identifiers={("matter", self.IDENTIFIER)},
+            identifiers={("matter", self.IDENTIFIER), ("matter", self.SERIAL)},
             name="BILRESA dual button",
             name_by_user="Bedroom BILRESA button",
             model="BILRESA dual button",

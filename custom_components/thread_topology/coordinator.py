@@ -131,6 +131,31 @@ def _normalize_address(address: str) -> str:
     return address.replace(":", "").replace("-", "").replace(" ", "").upper()
 
 
+def _matter_node_id(identifiers: Any) -> int | None:
+    """Find the Matter node id among a device's "matter" identifiers.
+
+    Home Assistant stores more than one: a
+    "deviceid_<fabric_hex>-<node_hex>-MatterNodeDevice" and a
+    "serial_<serial>". device.identifiers is a *set*, so reading whichever came
+    out first picked a different identifier between runs, and whenever it landed
+    on the serial - which carries no node id - the device silently lost its
+    diagnostics. That is what made Matter device identity flicker restart to
+    restart. Only the deviceid form is parsed, so a serial containing a dash
+    cannot be mistaken for one.
+    """
+    for value in identifiers:
+        if not isinstance(value, str) or not value.startswith("deviceid_"):
+            continue
+        parts = value[len("deviceid_"):].split("-")
+        if len(parts) < 2:
+            continue
+        try:
+            return int(parts[1], 16)
+        except ValueError:
+            continue
+    return None
+
+
 def _enum_value(value: Any) -> Any:
     """Unwrap an Enum to its value, leaving plain values alone."""
     return getattr(value, "value", value)
@@ -743,32 +768,22 @@ class ThreadTopologyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         diagnostics_by_node = await self._async_matter_node_diagnostics()
 
         for device in device_registry.devices.values():
-            # Find the "matter" identifier on this device, if any.
-            matter_identifier_value: str | None = None
-            for identifier in device.identifiers:
-                if identifier[0] == "matter":
-                    matter_identifier_value = identifier[1]
-                    break
-            if matter_identifier_value is None:
+            matter_identifiers = [
+                value for domain, value in device.identifiers if domain == "matter"
+            ]
+            if not matter_identifiers:
                 continue
 
             # Respect a name the user set in Home Assistant; device.name is the
             # factory name, which is identical across two of the same product.
             name = device.name_by_user or device.name or "Unknown"
 
-            # Match the registry entry to its Matter node by parsing the node id
-            # out of the identifier, stored as
-            # "deviceid_<fabric_hex>-<node_hex>-MatterNodeDevice".
-            diagnostics: dict[str, Any] = {}
-            try:
-                stripped = matter_identifier_value
-                if stripped.startswith("deviceid_"):
-                    stripped = stripped[len("deviceid_"):]
-                parts = stripped.split("-")
-                if len(parts) >= 2:
-                    diagnostics = diagnostics_by_node.get(int(parts[1], 16), {})
-            except (ValueError, IndexError):
-                pass
+            # Match the registry entry to its Matter node. Every matter
+            # identifier is considered, because they arrive in arbitrary order.
+            node_id = _matter_node_id(matter_identifiers)
+            diagnostics: dict[str, Any] = (
+                diagnostics_by_node.get(node_id, {}) if node_id is not None else {}
+            )
 
             mac_address = diagnostics.get("mac_address")
 
